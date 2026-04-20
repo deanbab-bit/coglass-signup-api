@@ -1,11 +1,15 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { NodeSSH } = require('node-ssh');
 const { Resend } = require('resend');
 
 const app = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
+
+const COOLIFY_URL  = 'http://62.210.200.21:8000';
+const COOLIFY_TOKEN = process.env.COOLIFY_TOKEN;
+const PROJECT_UUID  = 'iovrelskt1hg9h3evybc4xx0';
+const SERVER_UUID   = 'gixpnckiv88uhfw19rwvugpi';
 
 app.use(cors());
 app.use(express.json());
@@ -19,16 +23,94 @@ function slugify(name) {
     .slice(0, 20);
 }
 
+function buildCompose(slug, password) {
+  return `services:
+  db:
+    image: postgres:16
+    container_name: ${slug}-postgres
+    environment:
+      POSTGRES_DB: crmdb
+      POSTGRES_USER: crmuser
+      POSTGRES_PASSWORD: crmpass
+    volumes:
+      - ${slug}_pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - ${slug}-net
+  web:
+    image: coglass-app:latest
+    container_name: ${slug}-web
+    environment:
+      NODE_ENV: production
+      PORT: "3002"
+      DATABASE_URL: "postgres://crmuser:crmpass@db:5432/crmdb"
+      DATABASE_SSL: "false"
+      DEFAULT_ADMIN_USERNAME: "deanobab"
+      DEFAULT_ADMIN_PASSWORD: "${password}"
+      DEV_USERNAMES: "deanobab"
+      UPLOADS_DIR: "/app/uploads"
+      INSTALL_ID_DIR: "/app/config"
+      DEFAULT_SMS_SENDER_ID: "${slug}"
+      ANTHROPIC_API_KEY: "${process.env.ANTHROPIC_API_KEY || ''}"
+    volumes:
+      - ${slug}_uploads:/app/uploads
+      - ${slug}_config:/app/config
+    depends_on:
+      - db
+    restart: unless-stopped
+    networks:
+      - ${slug}-net
+      - coolify
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${slug}.rule=Host(\`${slug}.coglass.app\`)"
+      - traefik.http.routers.${slug}.entrypoints=https
+      - traefik.http.routers.${slug}.tls.certresolver=letsencrypt
+      - traefik.http.services.${slug}.loadbalancer.server.port=3002
+      - traefik.docker.network=coolify
+networks:
+  ${slug}-net:
+  coolify:
+    external: true
+volumes:
+  ${slug}_pg_data:
+  ${slug}_uploads:
+  ${slug}_config:
+`;
+}
+
+async function coolifyFetch(path, method = 'GET', body = null) {
+  const opts = {
+    method,
+    headers: {
+      Authorization: `Bearer ${COOLIFY_TOKEN}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${COOLIFY_URL}${path}`, opts);
+  return res.json();
+}
+
 async function provisionInstance(slug, password) {
-  const ssh = new NodeSSH();
-  await ssh.connect({
-    host: process.env.SSH_HOST,
-    username: process.env.SSH_USER,
-    password: process.env.SSH_PASSWORD,
+  const compose = buildCompose(slug, password);
+  const composeB64 = Buffer.from(compose).toString('base64');
+
+  // 1. Create service in Coolify
+  const svc = await coolifyFetch('/api/v1/services', 'POST', {
+    name: slug,
+    project_uuid: PROJECT_UUID,
+    environment_name: 'production',
+    server_uuid: SERVER_UUID,
+    docker_compose_raw: composeB64,
   });
-  const result = await ssh.execCommand(`bash /root/new-instance.sh ${slug} ${password}`);
-  ssh.dispose();
-  if (result.code !== 0) throw new Error(result.stderr || 'Provisioning failed');
+
+  if (!svc.uuid) throw new Error(`Coolify service creation failed: ${JSON.stringify(svc)}`);
+
+  // 2. Deploy it
+  await coolifyFetch(`/api/v1/deploy?uuid=${svc.uuid}`, 'GET');
+
   return `https://${slug}.coglass.app`;
 }
 
@@ -64,14 +146,11 @@ async function sendWelcomeEmail(email, companyName, instanceUrl, plan) {
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// Signup
 app.post('/signup', async (req, res) => {
   const { companyName, email, password, plan = 'Professional' } = req.body;
 
-  // Basic validation
   if (!companyName || !email || !password) {
     return res.status(400).json({ error: 'Company name, email and password are required.' });
   }
@@ -85,13 +164,13 @@ app.post('/signup', async (req, res) => {
   }
 
   try {
-    // 1. Provision the instance
+    // 1. Provision instance via Coolify API (SMS sender ID set automatically from slug)
     const instanceUrl = await provisionInstance(slug, password);
 
-    // 2. Send welcome email
+    // 2. Send welcome email via Resend
     await sendWelcomeEmail(email, companyName, instanceUrl, plan);
 
-    // 3. TODO: Create Stripe customer + subscription with trial
+    // 3. TODO: Stripe — create customer + 14-day trial subscription
     //    const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
     //    const customer = await stripe.customers.create({ email, name: companyName });
     //    const subscription = await stripe.subscriptions.create({
