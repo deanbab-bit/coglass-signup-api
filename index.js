@@ -23,7 +23,12 @@ function slugify(name) {
     .slice(0, 20);
 }
 
-function buildCompose(slug, password) {
+function usernameFromEmail(email) {
+  // Take the part before @ and strip non-alphanumeric chars, max 30 chars
+  return email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 30) || 'admin';
+}
+
+function buildCompose(slug, password, adminUsername) {
   return `services:
   db:
     image: postgres:16
@@ -45,7 +50,7 @@ function buildCompose(slug, password) {
       PORT: "3002"
       DATABASE_URL: "postgres://crmuser:crmpass@db:5432/crmdb"
       DATABASE_SSL: "false"
-      DEFAULT_ADMIN_USERNAME: "deanobab"
+      DEFAULT_ADMIN_USERNAME: "${adminUsername}"
       DEFAULT_ADMIN_PASSWORD: "${password}"
       DEV_USERNAMES: "deanobab"
       UPLOADS_DIR: "/app/uploads"
@@ -93,8 +98,8 @@ async function coolifyFetch(path, method = 'GET', body = null) {
   return res.json();
 }
 
-async function provisionInstance(slug, password) {
-  const compose = buildCompose(slug, password);
+async function provisionInstance(slug, password, adminUsername) {
+  const compose = buildCompose(slug, password, adminUsername);
   const composeB64 = Buffer.from(compose).toString('base64');
 
   // 1. Create service in Coolify
@@ -114,7 +119,7 @@ async function provisionInstance(slug, password) {
   return `https://${slug}.coglass.app`;
 }
 
-async function sendWelcomeEmail(email, companyName, instanceUrl, plan) {
+async function sendWelcomeEmail(email, companyName, instanceUrl, plan, adminUsername) {
   await resend.emails.send({
     from: 'Coglass <hello@coglass.app>',
     to: email,
@@ -125,15 +130,23 @@ async function sendWelcomeEmail(email, companyName, instanceUrl, plan) {
           <span style="font-size: 18px; font-weight: 300; letter-spacing: 3px; text-transform: uppercase; color: #004A66;">COGLASS</span>
         </div>
         <h1 style="font-size: 26px; font-weight: 700; margin-bottom: 16px;">You're all set, ${companyName}.</h1>
-        <p style="font-size: 16px; color: #5C7A8A; line-height: 1.6; margin-bottom: 32px;">
-          Your Coglass account is live. You're on a 14-day free trial of the <strong>${plan}</strong> plan — no charge until your trial ends.
+        <p style="font-size: 16px; color: #5C7A8A; line-height: 1.6; margin-bottom: 24px;">
+          Your Coglass account is live. You're on a 14-day free trial — no charge until your trial ends.
         </p>
+
+        <div style="background: #F4F8FA; border-radius: 10px; padding: 20px 24px; margin-bottom: 28px; border-left: 4px solid #29ABE2;">
+          <p style="margin: 0 0 12px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #004A66;">Your login details</p>
+          <p style="margin: 0 0 6px; font-size: 15px; color: #0D1F2D;"><strong>URL:</strong> <a href="${instanceUrl}" style="color: #29ABE2;">${instanceUrl}</a></p>
+          <p style="margin: 0 0 6px; font-size: 15px; color: #0D1F2D;"><strong>Username:</strong> ${adminUsername}</p>
+          <p style="margin: 0; font-size: 15px; color: #0D1F2D;"><strong>Password:</strong> the password you set when signing up</p>
+        </div>
+
         <a href="${instanceUrl}" style="display: inline-block; background: #29ABE2; color: white; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px; margin-bottom: 32px;">
           Open Coglass →
         </a>
+
         <p style="font-size: 14px; color: #5C7A8A; line-height: 1.6;">
-          Your account URL: <a href="${instanceUrl}" style="color: #29ABE2;">${instanceUrl}</a><br>
-          Bookmark this — it's your team's login page.
+          Bookmark your account URL — it's your team's login page. You can add more users in Settings once you're in.
         </p>
         <hr style="border: none; border-top: 1px solid #D6E8F0; margin: 32px 0;">
         <p style="font-size: 13px; color: #5C7A8A;">
@@ -163,12 +176,14 @@ app.post('/signup', async (req, res) => {
     return res.status(400).json({ error: 'Company name must contain at least one letter or number.' });
   }
 
+  const adminUsername = usernameFromEmail(email);
+
   try {
     // 1. Provision instance via Coolify API (SMS sender ID set automatically from slug)
-    const instanceUrl = await provisionInstance(slug, password);
+    const instanceUrl = await provisionInstance(slug, password, adminUsername);
 
     // 2. Send welcome email via Resend
-    await sendWelcomeEmail(email, companyName, instanceUrl, plan);
+    await sendWelcomeEmail(email, companyName, instanceUrl, plan, adminUsername);
 
     // 3. TODO: Stripe — create customer + 14-day trial subscription
     //    const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
