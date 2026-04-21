@@ -24,8 +24,7 @@ function slugify(name) {
 }
 
 function usernameFromEmail(email) {
-  // Take the part before @ and strip non-alphanumeric chars, max 30 chars
-  return email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 30) || 'admin';
+  return email.trim().toLowerCase();
 }
 
 function buildCompose(slug, password, adminUsername) {
