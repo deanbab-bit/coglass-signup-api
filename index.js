@@ -6,6 +6,7 @@ const { Resend } = require('resend');
 const { Client: SshClient } = require('ssh2');
 
 const app = express();
+app.set('trust proxy', true); // behind Traefik — use X-Forwarded-For for req.ip (rate limiting)
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const INTERNAL_EMAIL = process.env.INTERNAL_NOTIFY_EMAIL || 'contact@coglass.co.uk';
@@ -35,12 +36,46 @@ const PROVISION_SSH_KEY  = process.env.PROVISION_SSH_KEY; // private key text (O
 const MASTER_ADMIN_USERNAME = process.env.MASTER_ADMIN_USERNAME || 'deanobab';
 const MASTER_ADMIN_PASSWORD = process.env.MASTER_ADMIN_PASSWORD;
 
+// Abuse safeguards. The public signup form is currently off (display:none until
+// Stripe billing exists), so these protect the endpoint for when it goes live.
+// Cloudflare Turnstile is a privacy-first, no-PII captcha; leave TURNSTILE_SECRET
+// unset to disable the captcha check entirely (inert until you create a Turnstile
+// site + add the widget to signup.html).
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET; // unset = captcha disabled
+const RL_WINDOW_MS = 60 * 60 * 1000;          // rate-limit window: 1 hour
+const RL_PER_IP    = Number(process.env.RL_PER_IP || 3);    // max signups per IP / window
+const RL_GLOBAL    = Number(process.env.RL_GLOBAL || 30);   // max signups total / window (backstop)
+
 // In-memory pending signups (token → data). Expires after 30 min.
 const pendingSignups = new Map();
+
+// In-memory sliding-window rate limiter for /signup (per-IP + global backstop).
+const rlHits = new Map(); // ip -> number[] (recent hit timestamps)
+const rlGlobal = [];      // all hit timestamps across every IP
+function rateLimit(ip) {
+  const now = Date.now();
+  const cutoff = now - RL_WINDOW_MS;
+  while (rlGlobal.length && rlGlobal[0] < cutoff) rlGlobal.shift();
+  if (rlGlobal.length >= RL_GLOBAL) return { ok: false, scope: 'global' };
+  const arr = (rlHits.get(ip) || []).filter((t) => t >= cutoff);
+  if (arr.length >= RL_PER_IP) return { ok: false, scope: 'ip' };
+  arr.push(now);
+  rlHits.set(ip, arr);
+  rlGlobal.push(now);
+  return { ok: true };
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [token, data] of pendingSignups) {
     if (data.expiresAt < now) pendingSignups.delete(token);
+  }
+  // prune stale rate-limit buckets so the map can't grow unbounded
+  const cutoff = now - RL_WINDOW_MS;
+  for (const [ip, arr] of rlHits) {
+    const kept = arr.filter((t) => t >= cutoff);
+    if (kept.length) rlHits.set(ip, kept);
+    else rlHits.delete(ip);
   }
 }, 10 * 60 * 1000);
 
@@ -59,6 +94,25 @@ function toSmsId(name) {
 
 function usernameFromEmail(email) {
   return email.trim().toLowerCase();
+}
+
+// Cloudflare Turnstile captcha check. Returns true (passes) when no secret is
+// configured, so the check is completely inert until TURNSTILE_SECRET is set.
+async function verifyTurnstile(token, ip) {
+  if (!TURNSTILE_SECRET) return true; // captcha disabled
+  if (!token) return false;
+  try {
+    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ secret: TURNSTILE_SECRET, response: token, remoteip: ip || '' }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await r.json();
+    return Boolean(data.success);
+  } catch {
+    return false; // fail closed — a captcha we couldn't verify is not a pass
+  }
 }
 
 // Runs a single command on the instances box over SSH and resolves with
@@ -113,6 +167,26 @@ async function provisionInstance(slug, companyName, adminUsername, password) {
   await runRemoteCommand(`${slug} ${emailB64} ${pwB64} ${companyB64}`);
 
   return `https://${slug}.coglass.app`;
+}
+
+// Two companies can slugify to the same name (e.g. "AB Glass" / "A.B. Glass").
+// The box script refuses a colliding slug ("already exists", exit 3); on that
+// specific error we retry with slug2, slug3… so a second signup gets its own
+// instance instead of failing. Any other error (instance cap, compose failure)
+// is NOT a collision and propagates immediately.
+async function provisionWithUniqueSlug(baseSlug, companyName, adminUsername, password) {
+  const candidates = [baseSlug, ...[2, 3, 4, 5].map((n) => `${baseSlug}${n}`)];
+  let lastErr;
+  for (const slug of candidates) {
+    try {
+      return await provisionInstance(slug, companyName, adminUsername, password);
+    } catch (err) {
+      lastErr = err;
+      if (/already exists/i.test(err.message || '')) continue; // slug taken — next
+      throw err; // real failure — don't mask it behind a slug retry
+    }
+  }
+  throw lastErr;
 }
 
 // Best-effort: log in as the seeded master admin and set the tenant's SMS
@@ -255,7 +329,7 @@ app.get('/probe', async (req, res) => {
 
 // Step 1 — validate and send confirmation email
 app.post('/signup', async (req, res) => {
-  const { companyName, email, password, plan = 'Business' } = req.body;
+  const { companyName, email, password, plan = 'Business', turnstileToken } = req.body;
 
   if (!companyName || !email || !password) {
     return res.status(400).json({ error: 'Company name, email and password are required.' });
@@ -267,6 +341,21 @@ app.post('/signup', async (req, res) => {
   const slug = slugify(companyName);
   if (!slug) {
     return res.status(400).json({ error: 'Company name must contain at least one letter or number.' });
+  }
+
+  // Rate limit (per-IP + global) — stops signup/email-bombing.
+  const rl = rateLimit(req.ip);
+  if (!rl.ok) {
+    return res.status(429).json({
+      error: rl.scope === 'ip'
+        ? 'Too many signup attempts from your connection. Please try again later.'
+        : 'We’re receiving a lot of signups right now — please try again in a little while.',
+    });
+  }
+
+  // Captcha (inert unless TURNSTILE_SECRET is configured).
+  if (!(await verifyTurnstile(turnstileToken, req.ip))) {
+    return res.status(400).json({ error: 'Captcha verification failed. Please try again.' });
   }
 
   const token = crypto.randomBytes(32).toString('hex');
@@ -302,7 +391,7 @@ app.get('/confirm', async (req, res) => {
 
   try {
     const smsSenderId = toSmsId(pending.companyName);
-    const instanceUrl = await provisionInstance(
+    const instanceUrl = await provisionWithUniqueSlug(
       pending.slug,
       pending.companyName,
       pending.adminUsername,
