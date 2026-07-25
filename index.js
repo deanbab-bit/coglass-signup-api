@@ -3,18 +3,37 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Resend } = require('resend');
+const { Client: SshClient } = require('ssh2');
 
 const app = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-const COOLIFY_URL    = 'http://62.210.200.21:8000';
-const COOLIFY_TOKEN  = process.env.COOLIFY_TOKEN;
-const PROJECT_UUID   = 'iovrelskt1hg9h3evybc4xx0';
-const SERVER_UUID    = 'gixpnckiv88uhfw19rwvugpi';
 const INTERNAL_EMAIL = process.env.INTERNAL_NOTIFY_EMAIL || 'contact@coglass.co.uk';
 const REPLY_TO       = process.env.REPLY_TO_EMAIL || 'contact@coglass.co.uk';
 const BASE_URL       = process.env.BASE_URL  || 'https://signup-api.coglass.app';
 const SITE_URL       = process.env.SITE_URL  || 'https://coglass.co.uk';
+
+// Instance provisioning — runs the same script the HQ panel already uses, over
+// SSH. The old Coolify-API provisioning is gone (Coolify was decommissioned
+// 2026-07-08); /opt/hq-create-instance.sh on the instances box now does the
+// compose/env/Traefik/SSL work itself (including CRON_SECRET, master admin,
+// SEED_TRIAL_LICENCE, and sourcing Chatwoot/Unipile/Anthropic secrets from a
+// reference instance) — none of that needs to be built here anymore.
+const PROVISION_SSH_HOST = process.env.PROVISION_SSH_HOST || '138.201.52.175';
+const PROVISION_SSH_USER = process.env.PROVISION_SSH_USER || 'root';
+const PROVISION_SSH_KEY  = process.env.PROVISION_SSH_KEY; // private key text (OpenSSH/PEM)
+// NOTE: this key's authorized_keys entry on the box MUST be command-restricted
+// so it can never run anything except the provisioning script, e.g.:
+//   command="/opt/hq-create-instance.sh $SSH_ORIGINAL_COMMAND",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... signup-provision
+// That's why we send ONLY the arguments below, not the script path itself —
+// the forced command supplies the path, so the key can't be used to run
+// anything else even if the private key ever leaked.
+
+// Vendor master login, seeded on every instance by the provisioning script —
+// used here only for one follow-up API call after the instance is up (set the
+// tenant's branded SMS sender ID), not to seed anything itself.
+const MASTER_ADMIN_USERNAME = process.env.MASTER_ADMIN_USERNAME || 'deanobab';
+const MASTER_ADMIN_PASSWORD = process.env.MASTER_ADMIN_PASSWORD;
 
 // In-memory pending signups (token → data). Expires after 30 min.
 const pendingSignups = new Map();
@@ -42,108 +61,96 @@ function usernameFromEmail(email) {
   return email.trim().toLowerCase();
 }
 
-function buildCompose(slug, smsSenderId, password, adminUsername) {
-  // Per-instance secret for the daily Hetzner crons (morning tracking emails +
-  // stale-order "Needs attention" sweep). Baked into the compose so it survives
-  // every recreate — without it both crons silently skip the instance.
-  const cronSecret = crypto.randomBytes(32).toString('hex');
-  // Vendor master login, seeded on every instance (hidden from the customer —
-  // it has no linked employee so it never appears in their user list).
-  const masterUsername = process.env.MASTER_ADMIN_USERNAME || 'deanobab';
-  const masterPassword = process.env.MASTER_ADMIN_PASSWORD || 'Blues12332!';
-  return `services:
-  db:
-    image: postgres:16
-    container_name: ${slug}-postgres
-    environment:
-      POSTGRES_DB: crmdb
-      POSTGRES_USER: crmuser
-      POSTGRES_PASSWORD: crmpass
-    volumes:
-      - ${slug}_pg_data:/var/lib/postgresql/data
-    restart: unless-stopped
-    networks:
-      - ${slug}-net
-  web:
-    image: ghcr.io/deanbab-bit/coglass-app:latest
-    container_name: ${slug}-web
-    environment:
-      NODE_ENV: production
-      PORT: "3002"
-      DATABASE_URL: "postgres://crmuser:crmpass@db:5432/crmdb"
-      DATABASE_SSL: "false"
-      DEFAULT_ADMIN_USERNAME: "${adminUsername}"
-      DEFAULT_ADMIN_PASSWORD: "${password}"
-      DEV_USERNAMES: "deanobab"
-      MASTER_ADMIN_USERNAME: "${masterUsername}"
-      MASTER_ADMIN_PASSWORD: "${masterPassword}"
-      CRON_SECRET: "${cronSecret}"
-      APP_BASE_URL: "https://${slug}.coglass.app"
-      SEED_TRIAL_LICENCE: "true"
-      CHATWOOT_HMAC_SECRET: "${process.env.CHATWOOT_HMAC_SECRET || ''}"
-      UNIPILE_API_URL: "${process.env.UNIPILE_API_URL || ''}"
-      UNIPILE_API_KEY: "${process.env.UNIPILE_API_KEY || ''}"
-      UPLOADS_DIR: "/app/uploads"
-      INSTALL_ID_DIR: "/app/config"
-      DEFAULT_SMS_SENDER_ID: "${smsSenderId}"
-      ANTHROPIC_API_KEY: "${process.env.ANTHROPIC_API_KEY || ''}"
-      RESEND_API_KEY: "${process.env.RESEND_API_KEY || ''}"
-    volumes:
-      - ${slug}_uploads:/app/uploads
-      - ${slug}_config:/app/config
-    depends_on:
-      - db
-    restart: unless-stopped
-    networks:
-      - ${slug}-net
-      - coolify
-    labels:
-      - traefik.enable=true
-      - "traefik.http.routers.${slug}.rule=Host(\`${slug}.coglass.app\`)"
-      - traefik.http.routers.${slug}.entrypoints=https
-      - traefik.http.routers.${slug}.tls.certresolver=letsencrypt
-      - traefik.http.services.${slug}.loadbalancer.server.port=3002
-      - traefik.docker.network=coolify
-networks:
-  ${slug}-net:
-  coolify:
-    external: true
-volumes:
-  ${slug}_pg_data:
-  ${slug}_uploads:
-  ${slug}_config:
-`;
-}
-
-async function coolifyFetch(path, method = 'GET', body = null) {
-  const opts = {
-    method,
-    headers: {
-      Authorization: `Bearer ${COOLIFY_TOKEN}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${COOLIFY_URL}${path}`, opts);
-  return res.json();
-}
-
-async function provisionInstance(slug, smsSenderId, password, adminUsername) {
-  const compose = buildCompose(slug, smsSenderId, password, adminUsername);
-  const composeB64 = Buffer.from(compose).toString('base64');
-
-  const svc = await coolifyFetch('/api/v1/services', 'POST', {
-    name: slug,
-    project_uuid: PROJECT_UUID,
-    environment_name: 'production',
-    server_uuid: SERVER_UUID,
-    docker_compose_raw: composeB64,
+// Runs a single command on the instances box over SSH and resolves with
+// stdout, or rejects on a non-zero exit / connection failure.
+function runRemoteCommand(command) {
+  return new Promise((resolve, reject) => {
+    if (!PROVISION_SSH_KEY) return reject(new Error('PROVISION_SSH_KEY is not set'));
+    const conn = new SshClient();
+    conn
+      .on('ready', () => {
+        conn.exec(command, (err, stream) => {
+          if (err) {
+            conn.end();
+            return reject(err);
+          }
+          let stdout = '';
+          let stderr = '';
+          stream
+            .on('close', (code) => {
+              conn.end();
+              if (code !== 0) return reject(new Error(`Exit ${code}: ${(stderr || stdout).trim()}`));
+              resolve(stdout);
+            })
+            .on('data', (d) => {
+              stdout += d;
+            })
+            .stderr.on('data', (d) => {
+              stderr += d;
+            });
+        });
+      })
+      .on('error', reject)
+      .connect({
+        host: PROVISION_SSH_HOST,
+        username: PROVISION_SSH_USER,
+        privateKey: PROVISION_SSH_KEY,
+        readyTimeout: 20000,
+      });
   });
+}
 
-  if (!svc.uuid) throw new Error(`Coolify service creation failed: ${JSON.stringify(svc)}`);
-  await coolifyFetch(`/api/v1/deploy?uuid=${svc.uuid}`, 'GET');
+// Provisions a brand-new tenant instance by running the same script the HQ
+// panel uses (bash /opt/hq-create-instance.sh <slug> <b64 email> <b64 pw>
+// <b64 company>) directly on the instances box over SSH.
+async function provisionInstance(slug, companyName, adminUsername, password) {
+  const emailB64 = Buffer.from(adminUsername).toString('base64');
+  const pwB64 = Buffer.from(password).toString('base64');
+  const companyB64 = Buffer.from(companyName).toString('base64');
+
+  // Just the args — the authorized_keys forced command on the box supplies
+  // the actual script path (see PROVISION_SSH_KEY note above).
+  await runRemoteCommand(`${slug} ${emailB64} ${pwB64} ${companyB64}`);
+
   return `https://${slug}.coglass.app`;
+}
+
+// Best-effort: log in as the seeded master admin and set the tenant's SMS
+// sender ID from their company name, so outbound SMS is branded from day one
+// instead of falling back to a generic default. Retries because a freshly
+// provisioned container + its SSL cert can take a little while to come up.
+// Non-fatal by design — losing branding is far less bad than failing the
+// whole signup over a startup-timing race.
+async function seedSmsBranding(instanceUrl, smsSenderId) {
+  if (!MASTER_ADMIN_PASSWORD) return; // nothing to log in with — skip quietly
+  const maxAttempts = 8;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const loginRes = await fetch(`${instanceUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: MASTER_ADMIN_USERNAME, password: MASTER_ADMIN_PASSWORD }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!loginRes.ok) throw new Error(`login returned ${loginRes.status}`);
+      const { token } = await loginRes.json();
+
+      const settingsRes = await fetch(`${instanceUrl}/api/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ sms: { senderId: smsSenderId } }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!settingsRes.ok) throw new Error(`settings PATCH returned ${settingsRes.status}`);
+      return; // success
+    } catch (err) {
+      if (attempt === maxAttempts) {
+        console.error('SMS branding seed failed (non-fatal):', err.message);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
 }
 
 async function sendConfirmationEmail(email, companyName, confirmUrl) {
@@ -295,7 +302,13 @@ app.get('/confirm', async (req, res) => {
 
   try {
     const smsSenderId = toSmsId(pending.companyName);
-    const instanceUrl = await provisionInstance(pending.slug, smsSenderId, pending.password, pending.adminUsername);
+    const instanceUrl = await provisionInstance(
+      pending.slug,
+      pending.companyName,
+      pending.adminUsername,
+      pending.password
+    );
+    await seedSmsBranding(instanceUrl, smsSenderId);
     const signupAt = new Date().toUTCString();
 
     await Promise.all([
