@@ -414,6 +414,71 @@ app.get('/confirm', async (req, res) => {
   }
 });
 
+// ─── Internal: provision for a PAID signup ─────────────────────────────────
+//
+// coglass-accounts calls this once Stripe has confirmed a payment. It is a thin
+// wrapper over exactly the same provisioning the trial flow uses, on purpose:
+// the slug-collision retry, the box's instance cap and the SMS branding all
+// live here, and a second copy inside accounts would drift the first time any
+// of them changed. Accounts deliberately does NOT hold the provisioning SSH key.
+//
+// ⚠️ Not rate limited and not captcha'd, unlike /signup. The caller has already
+// taken a card payment, and turning a paying customer away because of a rate
+// limiter is a far worse failure than anything it would prevent. The shared
+// secret is what stands in for those checks here.
+app.post('/internal/provision', async (req, res) => {
+  const secret = process.env.INTERNAL_PROVISION_SECRET;
+  if (!secret) return res.status(501).json({ error: 'Internal provisioning is not configured.' });
+
+  // Length check first: timingSafeEqual throws on a length mismatch, and the
+  // comparison itself is constant-time so the secret can't be walked a byte
+  // at a time by timing the response.
+  const given = String(req.get('x-provision-secret') || '');
+  const authorised =
+    given.length === secret.length &&
+    crypto.timingSafeEqual(Buffer.from(given), Buffer.from(secret));
+  if (!authorised) return res.status(401).json({ error: 'Bad provisioning secret.' });
+
+  const companyName = String(req.body?.companyName || '').trim();
+  const email = String(req.body?.email || '').trim();
+  const plan = String(req.body?.plan || '').trim() || 'paid';
+  if (!companyName || !email) {
+    return res.status(400).json({ error: 'companyName and email are required.' });
+  }
+
+  const slug = slugify(companyName);
+  if (!slug) {
+    return res.status(400).json({ error: 'Company name must contain at least one letter or number.' });
+  }
+
+  // The customer never sees or types this. A paid signup arrives back from
+  // Stripe Checkout having chosen no password, and reaches its instance through
+  // the accounts magic link and SSO handoff instead — so a password we'd have
+  // to email in plain text would be a liability serving no purpose.
+  const password = crypto.randomBytes(24).toString('base64url');
+
+  try {
+    const instanceUrl = await provisionWithUniqueSlug(slug, companyName, usernameFromEmail(email), password);
+    await seedSmsBranding(instanceUrl, toSmsId(companyName));
+
+    // provisionWithUniqueSlug may have landed on slug2/slug3 after a collision,
+    // so read the slug back off the URL it actually built rather than trusting
+    // the one we asked for. Everything downstream keys on this.
+    const actualSlug = new URL(instanceUrl).hostname.split('.')[0];
+
+    // Dean's own heads-up. Never fatal: the instance exists either way, and
+    // failing the response here would make accounts retry a provision that
+    // has already succeeded.
+    sendInternalAlert(companyName, email, instanceUrl, plan, new Date().toUTCString())
+      .catch((e) => console.error('Internal alert failed:', e.message));
+
+    return res.json({ ok: true, slug: actualSlug, instanceUrl });
+  } catch (err) {
+    console.error('Internal provision error:', err);
+    return res.status(502).json({ error: err.message });
+  }
+});
+
 // ─── Start ─────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
