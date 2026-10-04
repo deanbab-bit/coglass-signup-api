@@ -145,17 +145,55 @@ async function seedSmsBranding(instanceUrl, smsSenderId) {
   }
 }
 
-function internalAlertHtml({ companyName, email, instanceUrl, plan, at, recovered }) {
+/** "£1.00 GBP / month", or null when the amount isn't known. */
+function formatAmount(sale) {
+  if (!sale || !Number.isInteger(sale.amountPence) || !sale.currency) return null;
+  const cur = sale.currency.toUpperCase();
+  const sym = { GBP: '£', EUR: '€', USD: '$', AUD: 'A$', NZD: 'NZ$', ZAR: 'R' }[cur] || '';
+  return `${sym}${(sale.amountPence / 100).toFixed(2)} ${cur} / month (ex tax)`;
+}
+
+/**
+ * The alert's subject. Says what was actually sold — "[New Trial]" only for a
+ * subscription that really is trialing, "[New Customer]" for one that paid
+ * straight away, "[TEST]" in front for the hidden £1 test plan or a Stripe
+ * test-mode purchase. Before accounts sends these details it says
+ * "[New instance]", never a guess.
+ */
+function internalAlertSubject({ companyName, sale }) {
+  const name = oneLine(companyName);
+  const test = sale && (sale.testPlan === true || sale.livemode === false) ? '[TEST] ' : '';
+  if (!sale || typeof sale.trial !== 'boolean') return `${test}[New instance] ${name} is built`;
+  return sale.trial ? `${test}[New Trial] ${name} just signed up` : `${test}[New Customer] ${name} just signed up`;
+}
+
+function internalAlertHtml({ companyName, email, instanceUrl, plan, sale, at, recovered }) {
   const e = escapeHtml;
+  const row = (label, value) =>
+    `<tr><td style="padding:6px 0;color:#555;width:130px"><strong>${e(label)}</strong></td><td style="padding:6px 0">${value}</td></tr>`;
+  const kind = !sale || typeof sale.trial !== 'boolean'
+    ? null
+    : sale.trial
+      ? 'Free trial — card on file, nothing charged yet'
+      : 'Paid — first payment taken, no free trial';
+  const amount = formatAmount(sale);
+  const testNote = sale && sale.testPlan === true
+    ? 'Hidden £1 test plan — remove this instance once the test is done.'
+    : sale && sale.livemode === false
+      ? 'Stripe TEST mode — no real money.'
+      : null;
   return `
       <div style="font-family:sans-serif;max-width:560px;color:#0D1F2D">
-        <h2 style="color:#0096C7;margin-bottom:4px">New paid instance built</h2>
+        <h2 style="color:#0096C7;margin-bottom:4px">${e(internalAlertSubject({ companyName, sale }))}</h2>
         <p style="color:#5C7A8A;margin-top:0">${e(at)}${recovered ? ' (recovered after a lost response)' : ''}</p>
+        ${testNote ? `<p style="background:#fdf6e9;border:1px solid #eecfa0;border-radius:6px;padding:8px 10px;color:#7a5b13">${e(testNote)}</p>` : ''}
         <table style="width:100%;border-collapse:collapse;margin-top:16px">
-          <tr><td style="padding:6px 0;color:#555;width:130px"><strong>Company</strong></td><td style="padding:6px 0">${e(companyName)}</td></tr>
-          <tr><td style="padding:6px 0;color:#555"><strong>Email</strong></td><td style="padding:6px 0"><a href="mailto:${e(encodeURIComponent(email))}">${e(email)}</a></td></tr>
-          <tr><td style="padding:6px 0;color:#555"><strong>Plan</strong></td><td style="padding:6px 0">${e(plan)}</td></tr>
-          <tr><td style="padding:6px 0;color:#555"><strong>Instance</strong></td><td style="padding:6px 0"><a href="${e(instanceUrl)}">${e(instanceUrl)}</a></td></tr>
+          ${row('Company', e(companyName))}
+          ${row('Email', `<a href="mailto:${e(encodeURIComponent(email))}">${e(email)}</a>`)}
+          ${row('Plan', e(plan))}
+          ${kind ? row('Billing', e(kind)) : ''}
+          ${amount ? row('Amount', e(amount)) : ''}
+          ${row('Instance', `<a href="${e(instanceUrl)}">${e(instanceUrl)}</a>`)}
         </table>
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
         <p style="font-size:12px;color:#999">Sent automatically by the Coglass signup API.</p>
@@ -168,7 +206,7 @@ async function sendInternalAlert(info) {
     from: 'Coglass Signups <hello@coglass.app>',
     reply_to: oneLine(info.email, 254),
     to: INTERNAL_EMAIL,
-    subject: `[New instance] ${oneLine(info.companyName)} is built`,
+    subject: internalAlertSubject(info),
     html: internalAlertHtml(info),
   });
 }
@@ -212,4 +250,4 @@ if (require.main === module) {
   app.listen(PORT, () => console.log(`Coglass signup API running on port ${PORT}`));
 }
 
-module.exports = { escapeHtml, oneLine, internalAlertHtml };
+module.exports = { escapeHtml, oneLine, internalAlertHtml, internalAlertSubject, formatAmount };
