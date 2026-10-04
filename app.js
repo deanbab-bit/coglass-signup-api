@@ -22,6 +22,22 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 
+/**
+ * The sale details accounts sends alongside a build (trial / testPlan /
+ * amountPence / currency / livemode). Each is kept only if it has the right
+ * type, so nothing odd reaches the alert. Returns null when none were sent.
+ */
+function saleFromBody(body) {
+  const b = body || {};
+  const sale = {};
+  if (typeof b.trial === 'boolean') sale.trial = b.trial;
+  if (typeof b.testPlan === 'boolean') sale.testPlan = b.testPlan;
+  if (Number.isInteger(b.amountPence) && b.amountPence >= 0 && b.amountPence < 1e9) sale.amountPence = b.amountPence;
+  if (typeof b.currency === 'string' && /^[a-z]{3}$/i.test(b.currency)) sale.currency = b.currency.toLowerCase();
+  if (typeof b.livemode === 'boolean') sale.livemode = b.livemode;
+  return Object.keys(sale).length ? sale : null;
+}
+
 function slugify(name) {
   return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
 }
@@ -214,6 +230,9 @@ function createApp({ store, storeError = null, runCommand, onProvisioned = () =>
     const companyName = String(req.body?.companyName || '').trim();
     const email = String(req.body?.email || '').trim();
     const plan = String(req.body?.plan || '').trim() || 'paid';
+    // What was sold — only used to label the team's alert. Absent from an
+    // older accounts service, in which case the alert says so rather than guess.
+    const sale = saleFromBody(req.body);
     if (!companyName || !email) return res.status(400).json({ error: 'companyName and email are required.' });
     if (companyName.length > 200 || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: 'companyName or email is not valid.' });
@@ -251,7 +270,7 @@ function createApp({ store, storeError = null, runCommand, onProvisioned = () =>
             error: `Every name for "${companyName}" (${base}, ${base}2 … ${base}5) is already taken. Choose one by hand.`,
           });
         }
-        rec = store.put(key, { state: 'pending', slug, companyName, email, plan, error: null });
+        rec = store.put(key, { state: 'pending', slug, companyName, email, plan, sale, error: null });
       }
       return await attempt(key, rec, res);
     } catch (err) {
@@ -363,7 +382,7 @@ function createApp({ store, storeError = null, runCommand, onProvisioned = () =>
     // them and think the build failed.
     res.json({ ok: true, slug: rec.slug, instanceUrl, ...(recovered ? { recovered: true } : {}) });
     try {
-      onProvisioned({ key, slug: rec.slug, instanceUrl, companyName: rec.companyName, email: rec.email, plan: rec.plan, smsSenderId: toSmsId(rec.companyName), recovered });
+      onProvisioned({ key, slug: rec.slug, instanceUrl, companyName: rec.companyName, email: rec.email, plan: rec.plan, sale: rec.sale || null, smsSenderId: toSmsId(rec.companyName), recovered });
     } catch (err) {
       log.error('After-provision step failed (non-fatal):', err.message);
     }
@@ -372,4 +391,4 @@ function createApp({ store, storeError = null, runCommand, onProvisioned = () =>
   return app;
 }
 
-module.exports = { createApp, slugify, toSmsId, slugCandidates, createLimiter };
+module.exports = { createApp, slugify, toSmsId, slugCandidates, createLimiter, saleFromBody };

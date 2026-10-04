@@ -9,7 +9,8 @@ const os = require('os');
 const path = require('path');
 const { createApp } = require('../app');
 const { ProvisionStore } = require('../provision-store');
-const { escapeHtml, internalAlertHtml, oneLine } = require('../index');
+const { escapeHtml, internalAlertHtml, internalAlertSubject, oneLine } = require('../index');
+const { saleFromBody } = require('../app');
 
 const SECRET = 'test-secret-value';
 let passed = 0;
@@ -384,6 +385,36 @@ const acme = (key) => ({ companyName: 'Acme Glass', email: 'owner@acme.test', pl
     assert.ok(!/href="mailto:[^"]*"onmouseover/.test(html));
     assert.strictEqual(escapeHtml(`'"<>&`), '&#39;&quot;&lt;&gt;&amp;');
     assert.strictEqual(oneLine('Acme\r\nBcc: x@y'), 'Acme Bcc: x@y');
+  });
+
+  await test('the team alert says what was actually sold (not "[New Trial]" for everything)', async () => {
+    // The live £1 test-plan purchase (glass4me, 2026-10-04) — paid, no trial.
+    const testPaid = { trial: false, testPlan: true, amountPence: 100, currency: 'gbp', livemode: true };
+    assert.strictEqual(internalAlertSubject({ companyName: 'glass4me', sale: testPaid }), '[TEST] [New Customer] glass4me just signed up');
+    assert.strictEqual(internalAlertSubject({ companyName: 'Acme', sale: { trial: true, testPlan: false, livemode: true } }), '[New Trial] Acme just signed up');
+    assert.strictEqual(internalAlertSubject({ companyName: 'Acme', sale: { trial: false, testPlan: false, livemode: true } }), '[New Customer] Acme just signed up');
+    assert.strictEqual(internalAlertSubject({ companyName: 'Acme', sale: { trial: true, testPlan: false, livemode: false } }), '[TEST] [New Trial] Acme just signed up', 'Stripe test mode is TEST too');
+    assert.strictEqual(internalAlertSubject({ companyName: 'Acme', sale: null }), '[New instance] Acme is built', 'an older accounts → no guess');
+    const html = internalAlertHtml({ companyName: 'glass4me', email: 'o@g.test', instanceUrl: 'https://glass4me.coglass.app', plan: 'test', sale: testPaid, at: 'now' });
+    assert.ok(html.includes('£1.00 GBP / month'), 'amount + currency in the body');
+    assert.ok(html.includes('Paid — first payment taken, no free trial'));
+    assert.ok(html.includes('Hidden £1 test plan'));
+    assert.ok(html.includes('<strong>Plan</strong></td><td style="padding:6px 0">test<'));
+    assert.ok(!/New Trial/.test(html));
+
+    // Only well-typed values get through from the request body.
+    assert.deepStrictEqual(saleFromBody({ trial: false, testPlan: true, amountPence: 100, currency: 'GBP', livemode: true }), testPaid);
+    assert.strictEqual(saleFromBody({ companyName: 'x' }), null);
+    assert.deepStrictEqual(saleFromBody({ trial: 'yes', amountPence: '100', currency: '<b>', testPlan: 1 }), null);
+  });
+
+  await test('sale details ride from the request to the alert', async () => {
+    const box = fakeBox();
+    await withServer({ box }, async (api, { provisioned }) => {
+      const r = await api.provision({ ...acme('prov_cs_sale0001'), plan: 'test', trial: false, testPlan: true, amountPence: 100, currency: 'gbp', livemode: true });
+      assert.strictEqual(r.status, 200);
+      assert.deepStrictEqual(provisioned[0].sale, { trial: false, testPlan: true, amountPence: 100, currency: 'gbp', livemode: true });
+    });
   });
 
   console.log(`\n${passed} passed${process.exitCode ? ', some FAILED' : ''}`);
